@@ -2,7 +2,7 @@ import sys
 sys.path.append('core')
 
 import argparse
-import glob
+import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -12,13 +12,19 @@ from utils.utils import InputPadder
 from PIL import Image
 from matplotlib import pyplot as plt
 
-
 DEVICE = 'cuda'
 
-def load_image(imfile):
-    img = np.array(Image.open(imfile)).astype(np.uint8)
+def load_image_from_frame(frame):
+    img = np.array(frame).astype(np.uint8)
     img = torch.from_numpy(img).permute(2, 0, 1).float()
     return img[None].to(DEVICE)
+
+def setup_camera(index):
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        print(f"Cannot open camera {index}")
+        exit()
+    return cap
 
 def demo(args):
     model = torch.nn.DataParallel(RAFTStereo(args), device_ids=[0])
@@ -28,17 +34,22 @@ def demo(args):
     model.to(DEVICE)
     model.eval()
 
+    cap1 = setup_camera(args.cam1)
+    cap2 = setup_camera(args.cam2)
+
     output_directory = Path(args.output_directory)
     output_directory.mkdir(exist_ok=True)
 
     with torch.no_grad():
-        left_images = sorted(glob.glob(args.left_imgs, recursive=True))
-        right_images = sorted(glob.glob(args.right_imgs, recursive=True))
-        print(f"Found {len(left_images)} images. Saving files to {output_directory}/")
+        while True:
+            ret1, frame1 = cap1.read()
+            ret2, frame2 = cap2.read()
+            if not ret1 or not ret2:
+                print("Error capturing frames from cameras")
+                break
 
-        for (imfile1, imfile2) in tqdm(list(zip(left_images, right_images))):
-            image1 = load_image(imfile1)
-            image2 = load_image(imfile2)
+            image1 = load_image_from_frame(frame1)
+            image2 = load_image_from_frame(frame2)
 
             padder = InputPadder(image1.shape, divis_by=32)
             image1, image2 = padder.pad(image1, image2)
@@ -46,23 +57,24 @@ def demo(args):
             _, flow_up = model(image1, image2, iters=args.valid_iters, test_mode=True)
             flow_up = padder.unpad(flow_up).squeeze()
 
-            file_stem = imfile1.split('/')[-2]
             if args.save_numpy:
-                np.save(output_directory / f"{file_stem}.npy", flow_up.cpu().numpy().squeeze())
-            plt.imsave(output_directory / f"{file_stem}.png", -flow_up.cpu().numpy().squeeze(), cmap='jet')
-
+                np.save(output_directory / "flow.npy", flow_up.cpu().numpy().squeeze())
+            plt.imshow(-flow_up.cpu().numpy().squeeze(), cmap='jet')
+            plt.show(block=False)
+            plt.pause(0.001)
+            plt.clf()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint", required=True)
     parser.add_argument('--save_numpy', action='store_true', help='save output as numpy arrays')
-    parser.add_argument('-l', '--left_imgs', help="path to all first (left) frames", default="datasets/Middlebury/MiddEval3/testH/*/im0.png")
-    parser.add_argument('-r', '--right_imgs', help="path to all second (right) frames", default="datasets/Middlebury/MiddEval3/testH/*/im1.png")
+    parser.add_argument('--cam1', type=int, default=0, help="index for the first camera")
+    parser.add_argument('--cam2', type=int, default=1, help="index for the second camera")
     parser.add_argument('--output_directory', help="directory to save output", default="demo_output")
-    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during forward pass')
 
-    # Architecture choices
+    # RAFTStereo specific arguments
+    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
     parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
     parser.add_argument('--shared_backbone', action='store_true', help="use a single backbone for the context and feature encoders")
